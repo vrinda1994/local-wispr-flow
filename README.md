@@ -6,7 +6,9 @@ speak, press **F12** again — cleaned-up text is pasted at your cursor.
 ## Pipeline
 
 ```
-F12 → mic capture → Whisper (ASR) → Gemma 4 (cleanup/tone) → paste at cursor
+For raw text: right option → mic capture → Whisper (ASR) → Gemma 4 (cleanup/tone) → paste at cursor
+For code: right command → mic capture → Whisper (ASR) → Gemma 4 (cleanup/tone) → paste at cursor
+
 ```
 
 - **ASR:** `mlx-whisper` (`large-v3-turbo`) — fast + accurate on Apple Silicon.
@@ -49,12 +51,10 @@ First-run gotchas (all in the README): macOS will need Microphone, Accessibility
 Settings → Privacy & Security, then restart the terminal. If F12 does nothing, enable "Use F1, F2… as standard function keys" or change HOTKEY. The very first
 transcription is slow (Whisper downloads large-v3-turbo ~1.5GB and warms up); subsequent ones are fast.
 
-AI feature roadmap — where Gemma earns its keep
+AI feature roadmap
 
-The whole point of a local LLM in the loop is that the cleanup stage is programmable. All of these are just SYSTEM_PROMPT / routing changes in dictation.py — no
-new infra:
 
-Tier 1 — polish (the MVP already does this)
+Tier 1 — polish 
 - Punctuation, capitalization, filler/false-start removal, faithful wording.
 
 Tier 2 — tone & format (your "tone/emotion" ask)
@@ -75,7 +75,3 @@ Tier 4 — UX polish
 - VAD auto-stop (end recording on silence instead of a second F12 press).
 - A menu-bar app (rewrite the daemon in Swift later for nicer hotkey/permission UX).
 
-My suggestion: get the MVP working end-to-end first (verify a real F12 → paste round-trip), then add app-aware formatting and tone modes — that's the combo that
-makes it feel like Wispr Flow rather than a transcription box.
-
-Want me to add the tone-mode hotkeys and app-aware formatting next, or wire up VAD auto-stop so you don't need the second F12 press?
