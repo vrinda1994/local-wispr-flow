@@ -1,15 +1,15 @@
-"""Local voice dictation with two modes — prose and code.
-
-Two-stage pipeline (like Wispr Flow):
-  1. mlx-whisper turns speech into an accurate raw transcript.
-  2. Your local Gemma 4 server turns that transcript into the final text:
-       • prose mode → cleaned-up dictation (punctuation, filler removal, tone)
-       • code mode  → idiomatic source code in the target language
-  The result is pasted at the cursor.
+"""Entry point: wires the modules into the push-to-talk dictation loop.
 
 Hold a key to talk, release to transcribe:
   • Right Option (⌥)  → prose dictation
-  • Right Command (⌘) → code dictation
+  • Right Command (⌘) → code dictation (multi-turn)
+Tap Right Control (⌃) → reset the code conversation.
+
+Prose voice commands (handled in commands.py / prompts.py):
+  • formatting    — "new paragraph", "make that a bulleted list", "all caps"
+  • self-correct  — "...send it Friday, no wait, Monday" → keeps only Monday
+  • translation   — "dictate in Spanish" → speak English, paste Spanish
+  • undo          — "undo" / "scratch that" → revert the last paste (⌘Z)
 
 Run:  uv run dictation.py
 Stop: Ctrl-C in this terminal.
@@ -19,245 +19,161 @@ from __future__ import annotations
 
 import sys
 import threading
-import time
 from collections import namedtuple
 
-import numpy as np
-import pyperclip
-import requests
-import sounddevice as sd
 from pynput import keyboard
 
-# --- Config ----------------------------------------------------------------
-SAMPLE_RATE = 16_000            # Whisper's native rate
-WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"
-SERVER_URL = "http://127.0.0.1:9379/v1/chat/completions"
-GEMMA_MODEL = "gemma4-e4b,gpu"
+import commands
+import config
+import prompts
 
-# Default language for code mode; override at any time by saying "in <language>".
-CODE_LANGUAGE = "python"
+# Pick the ASR engine from the env var. Importing conditionally means that in
+# `gemma` mode Whisper/mlx is never loaded at all.
+if config.ASR_BACKEND == "gemma":
+    import asr_gemma as asr_backend
+else:
+    import asr as asr_backend
 
-# --- The two "intelligence" prompts (edit these to tune behaviour) ----------
-PROSE_PROMPT = (
-    "You are a dictation post-processor. You receive a raw, automatically "
-    "transcribed snippet of someone speaking. Return a cleaned-up version that "
-    "is ready to paste into whatever they are writing. Rules:\n"
-    "- Fix punctuation, capitalization, and obvious transcription errors.\n"
-    "- Remove filler words (um, uh, like, you know) and false starts.\n"
-    "- Preserve the speaker's meaning, tone, and wording. Do NOT summarize, "
-    "answer questions, or add anything.\n"
-    "- If they clearly issue a formatting instruction (e.g. 'make this a bulleted "
-    "list', 'new paragraph'), apply it.\n"
-    "- Output ONLY the cleaned text, with no preamble, quotes, or explanation."
-)
+from editor import paste, strip_code_fences, undo_in_editor
+from llm import run_llm
+from recorder import Recorder
+from ui import show_block
 
-CODE_PROMPT = (
-    f"You are pair-programming by voice, building up a file one instruction at a "
-    f"time. Default language: {CODE_LANGUAGE}. If the speaker names a different "
-    "language, use that one. Each user turn is a rough, auto-transcribed spoken "
-    "instruction. You can see the code you produced on previous turns.\n"
-    "Rules:\n"
-    "- Output ONLY the NEW source code to insert at the cursor for THIS "
-    "instruction — usually a single line or a small block. Do NOT repeat code "
-    "you already emitted on earlier turns.\n"
-    "- Stay consistent with the code so far: reuse the same variable/function "
-    "names, indentation level, and style.\n"
-    "- No markdown fences or backticks, no prose, no explanation — raw code only.\n"
-    "- Interpret spoken operators sensibly (e.g. 'equals equals' -> ==, "
-    "'not equal' -> !=, 'arrow' -> =>, 'new line' -> a line break).\n"
-    "- Honor spoken edits: 'scratch that' / 'undo' means discard the previous "
-    "instruction; reissue corrected code if they restate it.\n"
-    "- The output is pasted directly into the editor, so it must be ready to run."
-)
-
-# Each push-to-talk key maps to a mode.
-Mode = namedtuple("Mode", "label key_name system max_tokens is_code")
+Mode = namedtuple("Mode", "label key_name max_tokens kind")
 MODES = {
-    keyboard.Key.alt_r: Mode("prose", "Right Option (⌥)", PROSE_PROMPT, 512, False),
-    keyboard.Key.cmd_r: Mode("code", "Right Command (⌘)", CODE_PROMPT, 1024, True),
+    config.PROSE_KEY: Mode("prose", "Right Option (⌥)", config.PROSE_MAX_TOKENS, "prose"),
+    config.CODE_KEY: Mode("code", "Right Command (⌘)", config.CODE_MAX_TOKENS, "code"),
 }
 
-# Tap (press + release, no hold) this key to start a fresh code conversation.
-RESET_KEY = keyboard.Key.ctrl_r          # Right Control
-# Keep at most this many past turns of code context (user+assistant messages).
-MAX_HISTORY_MESSAGES = 30
-
-# If the whole utterance is just one of these, undo the last paste (editor ⌘Z)
-# instead of sending it to the model. Matched on the full, cleaned transcript so
-# a mid-sentence "scratch that" still reaches the LLM as a correction.
-UNDO_PHRASES = {
-    "undo", "undo that", "undo last", "scratch", "scratch that",
-    "delete that", "delete that line", "delete line", "delete last line",
-    "remove that", "remove that line",
-}
-
-# --- Lazy model load (first transcription is slow; later ones are fast) -----
-import mlx_whisper  # noqa: E402  (imported here so the startup banner prints first)
-
-
-class Recorder:
-    """Captures mic audio into memory while active."""
-
-    def __init__(self):
-        self._frames: list[np.ndarray] = []
-        self._stream: sd.InputStream | None = None
-
-    def start(self):
-        self._frames = []
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            callback=lambda data, *_: self._frames.append(data.copy()),
-        )
-        self._stream.start()
-
-    def stop(self) -> np.ndarray:
-        assert self._stream is not None
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
-        if not self._frames:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(self._frames, axis=0).flatten()
-
-
-def transcribe(audio: np.ndarray) -> str:
-    """Speech -> raw text via local Whisper.
-
-    Pass the float32 samples straight to Whisper. Giving it a *file path* would
-    make it shell out to ffmpeg to decode; passing the in-memory array (already
-    16 kHz mono float32 from sounddevice) skips ffmpeg entirely.
-    """
-    result = mlx_whisper.transcribe(
-        audio.astype(np.float32), path_or_hf_repo=WHISPER_REPO
-    )
-    return result["text"].strip()
-
-
-def run_llm(messages: list[dict], max_tokens: int) -> str:
-    """Send a full chat message list to the local Gemma server, return the reply."""
-    payload = {
-        "model": GEMMA_MODEL,
-        "top_k": 1,            # greedy/deterministic. (temp omitted on purpose:
-        "max_tokens": max_tokens,  # temperature=0 crashes this GPU sampler build.)
-        "messages": messages,
-    }
-    resp = requests.post(SERVER_URL, json=payload, timeout=120)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
-
-
-def strip_code_fences(text: str) -> str:
-    """Remove a leading ```lang fence and trailing ``` if the model added them."""
-    t = text.strip()
-    if t.startswith("```"):
-        lines = t.splitlines()[1:]               # drop opening fence line
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]                   # drop closing fence
-        t = "\n".join(lines)
-    return t.strip("\n")
-
-
-def is_undo_command(text: str) -> bool:
-    """True if the whole utterance is a delete/undo command (not mid-sentence)."""
-    cleaned = "".join(c for c in text.lower() if c.isalnum() or c.isspace()).strip()
-    return cleaned in UNDO_PHRASES
-
-
-def undo_in_editor():
-    """Trigger the frontmost editor's own undo (⌘Z) — removes the last paste."""
-    kb = keyboard.Controller()
-    with kb.pressed(keyboard.Key.cmd):
-        kb.press("z")
-        kb.release("z")
-
-
-def paste(text: str):
-    """Insert text at the cursor in the frontmost app (clipboard + Cmd-V)."""
-    previous = ""
-    try:
-        previous = pyperclip.paste()
-    except Exception:
-        pass
-    pyperclip.copy(text)
-    time.sleep(0.05)
-    kb = keyboard.Controller()
-    with kb.pressed(keyboard.Key.cmd):
-        kb.press("v")
-        kb.release("v")
-    time.sleep(0.1)
-    if previous:  # restore the user's old clipboard
-        pyperclip.copy(previous)
-
-
-def _block(label: str, text: str):
-    """Print a labelled, multi-line block with real line breaks (not repr)."""
-    width = 52
-    print(f"   ┌─ {label} " + "─" * max(2, width - len(label) - 5))
-    for line in text.splitlines() or [""]:
-        print(f"   │ {line}")
-    print("   └" + "─" * (width - 1))
-
-
-# --- State machine ---------------------------------------------------------
+# --- Session state ---------------------------------------------------------
 _recorder = Recorder()
 _recording = False
 _busy = False
 _active_key = None
 _lock = threading.Lock()
-_code_history: list[dict] = []   # multi-turn context for code mode (user+assistant)
+_code_history: list[dict] = []          # multi-turn code context (whisper mode)
+_code_so_far = ""                       # accumulated code context (gemma one-shot)
+_prose_lang = config.DEFAULT_PROSE_LANGUAGE   # current prose translation target
 
 
 def _reset_code_session():
-    if _code_history:
+    global _code_so_far
+    if _code_history or _code_so_far:
         _code_history.clear()
+        _code_so_far = ""
         print("🧹 code conversation reset — next code turn starts fresh\n")
 
 
-def _process(audio: np.ndarray, mode: Mode):
+def _apply_language_command(cmd):
+    """cmd is ('set', '<Language>') or ('off', None) from commands.py."""
+    global _prose_lang
+    action, lang = cmd
+    if action == "off":
+        _prose_lang = None
+        print("🌐 translation off — prose stays in English\n")
+    else:
+        _prose_lang = lang
+        print(f"🌐 prose will be translated → {lang}\n")
+
+
+def _handle_prose(raw: str, mode: Mode):
+    # Whole-utterance translation switch is a command, not dictation.
+    cmd = commands.parse_language_command(raw)
+    if cmd:
+        _apply_language_command(cmd)
+        return
+    system = prompts.build_prose_system(_prose_lang)
+    out = run_llm(
+        [{"role": "system", "content": system}, {"role": "user", "content": raw}],
+        mode.max_tokens,
+    )
+    label = mode.label + (f" → {_prose_lang}" if _prose_lang else "")
+    show_block(label, out)
+    paste(out)
+    print("✅ pasted\n")
+
+
+def _handle_code(raw: str, mode: Mode):
+    messages = (
+        [{"role": "system", "content": prompts.CODE_PROMPT}]
+        + _code_history
+        + [{"role": "user", "content": raw}]
+    )
+    out = strip_code_fences(run_llm(messages, mode.max_tokens))
+    _code_history.append({"role": "user", "content": raw})
+    _code_history.append({"role": "assistant", "content": out})
+    del _code_history[:-config.MAX_HISTORY_MESSAGES]   # cap context growth
+    show_block(f"{mode.label} (turn {len(_code_history) // 2})", out)
+    paste(out)
+    print("✅ pasted\n")
+
+
+def _run_whisper(audio, mode: Mode):
+    """Two-stage path: Whisper transcribes, then Gemma cleans (full command layer)."""
+    print(f"⏳ transcribing… [{mode.label}]")
+    raw = asr_backend.transcribe(audio)
+    if not raw:
+        print("… nothing heard")
+        return
+    show_block("raw", raw)
+
+    # Voice commands only work here, where we have a transcript to inspect.
+    if commands.is_undo(raw):
+        undo_in_editor()
+        del _code_history[-2:]              # forget that turn (no-op if empty)
+        print("↩️  undo — reverted the last paste\n")
+        return
+
+    if mode.kind == "prose":
+        _handle_prose(raw, mode)
+    else:
+        _handle_code(raw, mode)
+
+
+def _run_gemma(audio, mode: Mode):
+    """One-shot path: audio + system prompt go to Gemma in a single call.
+
+    No intermediate transcript, so voice commands (undo, translation toggle) are
+    not available here — but cleanup, formatting, and self-correction still work
+    because the model applies them in-prompt, and it can hear your tone directly.
+    """
+    global _code_so_far
+    print(f"🧠 {mode.label} (audio → Gemma, single call)…")
+    if mode.kind == "prose":
+        out = asr_backend.process_audio(
+            audio, prompts.build_prose_system(_prose_lang), mode.max_tokens,
+            instruction=prompts.PROSE_AUDIO_INSTRUCTION,
+        )
+        label = mode.label + (f" → {_prose_lang}" if _prose_lang else "")
+        show_block(label, out)
+    else:
+        instruction = (
+            "You are pair-programming by voice. The code written so far is:\n"
+            f"{_code_so_far or '(none yet)'}\n\n"
+            "The user just spoke a new instruction (attached audio). Output ONLY "
+            "the new code to append for it, consistent with the code above."
+        )
+        out = strip_code_fences(
+            asr_backend.process_audio(
+                audio, prompts.CODE_PROMPT, mode.max_tokens, instruction=instruction
+            )
+        )
+        _code_so_far = (_code_so_far + "\n" + out).strip()
+        show_block(f"{mode.label} (audio)", out)
+    paste(out)
+    print("✅ pasted\n")
+
+
+def _process(audio, mode: Mode):
     global _busy
     try:
-        if audio.size < SAMPLE_RATE * 0.3:  # <0.3s -> ignore stray taps
+        if audio.size < config.SAMPLE_RATE * 0.3:   # <0.3s -> ignore stray taps
             print("… too short, skipped")
             return
-        print(f"⏳ transcribing… [{mode.label}]")
-        raw = transcribe(audio)
-        if not raw:
-            print("… nothing heard")
-            return
-        _block("raw", raw)
-
-        if is_undo_command(raw):
-            undo_in_editor()                 # remove the last paste via editor ⌘Z
-            del _code_history[-2:]           # and forget that turn (no-op if empty)
-            print("↩️  undo — reverted the last paste\n")
-            return
-
-        print(f"🧠 {mode.label}…")
-
-        if mode.is_code:
-            # Multi-turn: the model sees prior turns so it can build code
-            # line by line, keeping names/indentation consistent.
-            messages = (
-                [{"role": "system", "content": mode.system}]
-                + _code_history
-                + [{"role": "user", "content": raw}]
-            )
-            out = strip_code_fences(run_llm(messages, mode.max_tokens))
-            _code_history.append({"role": "user", "content": raw})
-            _code_history.append({"role": "assistant", "content": out})
-            del _code_history[:-MAX_HISTORY_MESSAGES]  # cap context growth
-            turns = len(_code_history) // 2
-            _block(f"{mode.label} (turn {turns})", out)
+        if config.ASR_BACKEND == "gemma":
+            _run_gemma(audio, mode)
         else:
-            messages = [
-                {"role": "system", "content": mode.system},
-                {"role": "user", "content": raw},
-            ]
-            out = run_llm(messages, mode.max_tokens)
-            _block(mode.label, out)
-
-        paste(out)
-        print("✅ pasted\n")
+            _run_whisper(audio, mode)
     except Exception as e:  # keep the daemon alive on any failure
         print(f"❌ {type(e).__name__}: {e}\n", file=sys.stderr)
     finally:
@@ -297,7 +213,7 @@ def _on_press(key):
 def _on_release(key):
     if key in MODES:
         _stop(key)
-    elif key == RESET_KEY:        # tap Right Control to clear the code session
+    elif key == config.RESET_KEY:
         _reset_code_session()
 
 
@@ -305,9 +221,15 @@ def main():
     print("🎙️  Voice dictation ready.")
     for mode in MODES.values():
         print(f"    Hold {mode.key_name:18} → {mode.label}")
-    print(f"    Tap  Right Control (⌃)   → reset code conversation")
-    print(f"    Code language: {CODE_LANGUAGE}  (say 'in <language>' to override)")
-    print(f"    ASR: {WHISPER_REPO}   LLM: {GEMMA_MODEL}")
+    print("    Tap  Right Control (⌃)   → reset code conversation")
+    print(f"    Code language: {config.CODE_LANGUAGE}")
+    print(f"    Prose translation: {_prose_lang or 'off'}  (say 'dictate in <language>')")
+    if config.ASR_BACKEND == "gemma":
+        print("    ASR backend: Gemma (audio-direct, single call, no Whisper)")
+        print("      ↳ voice undo / 'dictate in <lang>' unavailable; use ⌃ to reset code,")
+        print("        and PROSE_LANGUAGE=<lang> to translate")
+    else:
+        print(f"    ASR backend: Whisper ({config.WHISPER_REPO})")
     print("    Gemma server must be running on :9379. Ctrl-C to quit.\n")
     with keyboard.Listener(on_press=_on_press, on_release=_on_release) as listener:
         listener.join()
