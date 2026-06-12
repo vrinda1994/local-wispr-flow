@@ -24,13 +24,15 @@ import requests
 
 from config import GEMMA_MODEL, SAMPLE_RATE, SERVER_URL
 
+# Model-card-aligned defaults (https://ai.google.dev/gemma/docs/core/model_card_4
+# §6 Audio): concise system, canonical ASR instruction, audio placed after text.
 _VERBATIM_SYSTEM = (
-    "You are a speech-to-text engine. Transcribe the audio exactly as spoken. "
-    "Output only the transcription — no commentary, labels, or quotation marks."
+    "You are Gemma operating in speech mode. Output only the requested text — no "
+    "commentary, labels, or quotation marks."
 )
-_DEFAULT_INSTRUCTION = (
-    "The user spoke the attached audio. Transcribe it, then apply your "
-    "instructions to the transcription."
+_ASR_INSTRUCTION = (
+    "Transcribe the following speech segment in English into English text. "
+    "Write numbers as digits and keep it on a single line."
 )
 
 
@@ -68,21 +70,21 @@ def _post(messages: list[dict], max_tokens: int) -> str:
 
 
 def transcribe(audio: np.ndarray) -> str:
-    """Verbatim speech -> text via Gemma. Drop-in replacement for asr.transcribe."""
+    """Verbatim speech -> text via Gemma (canonical ASR prompt). Drop-in for
+    asr.transcribe."""
     return _post(
         [{"role": "system", "content": _VERBATIM_SYSTEM},
-         _audio_message("Transcribe this audio.", audio)],
+         _audio_message(_ASR_INSTRUCTION, audio)],
         max_tokens=512,
     )
 
 
 def process_audio(audio: np.ndarray, system_prompt: str, max_tokens: int = 512,
                   instruction: str | None = None) -> str:
-    """One-shot: transcribe AND apply `system_prompt` in a single Gemma call —
-    the fully Whisper-free pipeline. `instruction` overrides the default text
-    that accompanies the audio (used by code mode to pass the code-so-far)."""
+    """One-shot audio call. `system_prompt` + `instruction` should follow the
+    model card's audio templates (see prompts.gemma_prose_instruction)."""
     return _post(
         [{"role": "system", "content": system_prompt},
-         _audio_message(instruction or _DEFAULT_INSTRUCTION, audio)],
+         _audio_message(instruction or _ASR_INSTRUCTION, audio)],
         max_tokens,
     )

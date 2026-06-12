@@ -36,15 +36,38 @@ PROSE_PROMPT = (
 )
 
 
-# Instruction paired with the audio in gemma one-shot prose mode. Audio-native
-# models lean toward a *literal* transcript (keeping "um", repeats), so this
-# states explicitly that the job is cleanup, not transcription.
-PROSE_AUDIO_INSTRUCTION = (
-    "Listen to the attached audio and produce the final, cleaned text following "
-    "all the rules above. This is NOT a transcription task — aggressively remove "
-    "every filler word (um, uh, er, like, you know), stutter, repeated word, and "
-    "false start, and fix punctuation. Output only the polished result."
+# --- Gemma audio-direct prompts (model-card aligned) ------------------------
+# https://ai.google.dev/gemma/docs/core/model_card_4 §6 Audio.
+# Gemma 4 audio is tuned for transcription/translation with SHORT, canonical
+# instructions (not a big text-cleanup prompt). Audio is placed after the text,
+# numbers as digits, output on a single line.
+GEMMA_AUDIO_SYSTEM = (
+    "You are Gemma operating in speech mode. Follow the instruction exactly and "
+    "output only the requested text — no preamble, labels, or quotation marks."
 )
+
+
+def gemma_prose_instruction(target_language=None):
+    """Canonical ASR/AST instruction for the gemma one-shot prose path."""
+    if target_language:
+        # Canonical AST template (model card §6) — use it VERBATIM. The model
+        # replies with the English transcription, a newline, then
+        # "<Language>: <translation>". Deviating from this format (e.g. "output
+        # only the translation") makes E4B refuse to translate. We pull the
+        # translation off the label line afterwards in dictation.py.
+        return (
+            "Transcribe the following speech segment in English, then translate "
+            f"it into {target_language}."
+        )
+    # NOTE: lead with a *dictation/writing* task, not "Transcribe" — the word
+    # "transcribe" pushes E4B into faithful-ASR mode where it keeps every "um".
+    return (
+        "The attached audio is a person dictating a message. Write out their "
+        "message as clean, polished text ready to paste. Omit every filler word "
+        "(um, uh, er, like, you know), false start, and repeated word; fix "
+        "punctuation and capitalization. Do not transcribe verbatim. Output only "
+        "the final message on a single line, numbers as digits."
+    )
 
 
 def build_prose_system(target_language=None):

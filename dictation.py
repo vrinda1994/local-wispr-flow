@@ -139,13 +139,15 @@ def _run_gemma(audio, mode: Mode):
     """
     global _code_so_far
     print(f"🧠 {mode.label} (audio → Gemma, single call)…")
+    if audio.size > 30 * config.SAMPLE_RATE:        # model card: 30s audio max
+        print("   ⚠️  >30s of audio — Gemma may truncate it (model card limit)")
     if mode.kind == "prose":
         out = asr_backend.process_audio(
-            audio, prompts.build_prose_system(_prose_lang), mode.max_tokens,
-            instruction=prompts.PROSE_AUDIO_INSTRUCTION,
+            audio, prompts.GEMMA_AUDIO_SYSTEM, mode.max_tokens,
+            instruction=prompts.gemma_prose_instruction(_prose_lang),
         )
         label = mode.label + (f" → {_prose_lang}" if _prose_lang else "")
-        show_block(label, out)
+        show_block(label, out)      # raw Gemma output, pasted as-is (no extraction)
     else:
         instruction = (
             "You are pair-programming by voice. The code written so far is:\n"
